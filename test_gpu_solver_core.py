@@ -130,6 +130,60 @@ def test_fallback_matches_cpu_for_nonmonochromatic_drive(use_linear, dt_reconstr
     assert rel_err < max_rel_err
 
 
+def test_ultrashort_pulse_continuous_local_drive():
+    """A Gaussian pulse much narrower than the system's natural timescale
+    (SIGMA=0.05 against a hopping-set timescale of order 1) breaks the
+    periodic-reassembly fallback: `dt_reconstruct` would need to be pushed
+    so fine that per-interval overhead dominates completely (measured
+    ~1000x slower than CPU at that extreme in FINDINGS.md).
+
+    `enable_continuous_local_drive` (evaluate the local perturbation via
+    `kernels.PerturbationExtractor` at every dopri5 substep instead of
+    reassembling the whole system on a separate `dt_reconstruct` grid) plus
+    `max_step` (bound the trial step so the adaptive controller cannot
+    blindly step over the pulse) fixes this.
+
+    The CPU reference here needs a checkpoint spacing far finer than looks
+    necessary at a glance (SIGMA/1000, not SIGMA/10): tkwant's own adaptive
+    stepper can silently under-resolve a pulse this narrow and give a
+    wrong-but-plausible-looking answer without raising any error -- verified
+    by cross-checking multiple independent checkpoint spacings against each
+    other (see FINDINGS.md). A coarser reference would make this test
+    compare against the wrong answer.
+    """
+    V0 = 0.3
+    T0 = 10.0
+    SIGMA = 0.05
+    t_final = 20.0
+
+    def onsite_pulse(site, time):
+        return V0 * np.exp(-(time - T0) ** 2 / (2 * SIGMA ** 2))
+
+    fsys = make_1d_chain(onsite_pulse)
+
+    checkpoints = (list(np.arange(0, 9.7, 1.0))
+                   + list(np.arange(9.7, 10.3, SIGMA / 1000))
+                   + list(np.arange(10.3, t_final + 0.001, 1.0)))
+    psi_cpu = make_wavefunction(fsys)
+    for tt in checkpoints:
+        psi_cpu.evolve(float(tt))
+    psi_cpu.evolve(t_final)
+    cpu_psibar = ordered_psibar(psi_cpu)
+
+    psi_gpu = make_wavefunction(fsys)
+    solver = BatchGPUSolver(psi_gpu)
+    solver.attach_fsys(fsys, omega=None)
+    solver.enable_continuous_local_drive()
+    solver.max_step = SIGMA
+    psi_gpu.evolve = solver.evolve
+    psi_gpu.evolve(t_final)
+    gpu_psibar = ordered_psibar(psi_gpu)
+
+    per_state_err = (np.linalg.norm(cpu_psibar - gpu_psibar, axis=0)
+                     / np.linalg.norm(cpu_psibar, axis=0))
+    assert np.median(per_state_err) < 1e-3
+
+
 def test_evolve_is_noop_at_current_time():
     fsys = make_1d_chain(onsite_sinusoidal)
     psi = make_wavefunction(fsys)

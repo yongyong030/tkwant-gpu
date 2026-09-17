@@ -125,6 +125,8 @@ class BatchGPUSolver:
         self._fsys = None
         self._src_gpu = None
         self._pert_extractor = None
+        self._continuous_local_ready = False
+        self.max_step = np.inf
 
         try:
             import cupy as cp
@@ -525,9 +527,70 @@ class BatchGPUSolver:
         """Evaluate d(Psi)/dt for the batch, dispatching on the active H(t) mode."""
         if getattr(self, '_exact_H_ready', False):
             return self._rhs_exact(Psi_gpu, t)
+        if getattr(self, '_continuous_local_ready', False):
+            return self._rhs_continuous_local(Psi_gpu, t)
         if getattr(self, '_H_lin_ready', False):
             return self._rhs_linear(Psi_gpu, t)
         return self._rhs_frozen(Psi_gpu)
+
+    def enable_continuous_local_drive(self):
+        """Evaluate W(t) at every dopri5 substep via `kernels.PerturbationExtractor`,
+        instead of periodically reassembling H(t) via `hamiltonian_submatrix` on a
+        `dt_reconstruct` grid decoupled from the ODE's own adaptive step size.
+
+        `update_H`/`update_H_linear` cost is dominated by `hamiltonian_submatrix`,
+        which reassembles the whole system regardless of how localized the
+        perturbation is. When the drive is spatially local (e.g. a single
+        driven site/dot, as opposed to a perturbation spread across the whole
+        lattice), `PerturbationExtractor.data(t)` recomputes only the nnz
+        time-dependent matrix elements every call, cheaply enough to call at
+        every substep -- removing `dt_reconstruct` (and its overhead/accuracy
+        trade-off) entirely, matching how tkwant's own native per-state kernel
+        already evaluates W(t). This is a poor fit for a broadly time-dependent
+        drive (see the calibration in `_try_make_perturbation_extractor`) --
+        useful specifically for narrow, localized, and/or ultrashort-in-time
+        drives where `dt_reconstruct` would otherwise need to be pushed very
+        small, e.g. a voltage pulse through a small quantum dot.
+
+        Requires `attach_fsys` to have been called first (with any `omega`;
+        this mode replaces the non-monochromatic fallback path).
+        """
+        if not getattr(self, '_fast_update_ready', False):
+            raise RuntimeError('enable_continuous_local_drive requires attach_fsys(...) first')
+        from tkwant.onebody import kernels
+        state0 = self._states[0]
+        extractor = kernels.PerturbationExtractor(
+            self._fsys, state0.time_name, state0.time_start, state0.params)
+        row, col = extractor.row_col()
+        n = self._n_central
+
+        self._cont_extractor = extractor
+        self._cont_data_buf = np.zeros(len(row), dtype=complex)
+        if self._use_gpu:
+            cp = self._cp
+            self._cont_row_gpu = cp.asarray(row, dtype=cp.int32)
+            self._cont_col_gpu = cp.asarray(col, dtype=cp.int32)
+            self._cont_psi_st_gpu = cp.asarray(self._psi_st_central[:n, :])
+            self._cont_shape = (n, n)
+        self._continuous_local_ready = True
+        logger.info('Continuous local-drive mode enabled (nnz=%d, n_central=%d)',
+                    len(row), n)
+
+    def _rhs_continuous_local(self, Psi_gpu, t):
+        cp = self._cp
+        self._cont_extractor.data(float(t), out=self._cont_data_buf)
+        data_gpu = cp.asarray(self._cont_data_buf)
+        delta = self._csp.coo_matrix(
+            (data_gpu, (self._cont_row_gpu, self._cont_col_gpu)),
+            shape=self._cont_shape).tocsr()
+
+        n = self._cont_shape[0]
+        dPsi = self._H_eff0_gpu_base.dot(Psi_gpu)
+        dPsi[:n, :] += delta.dot(Psi_gpu[:n, :])
+        dPsi *= -1j
+        dPsi += 1j * Psi_gpu * self._delta_E_gpu
+        dPsi[:n, :] += -1j * delta.dot(self._cont_psi_st_gpu)
+        return dPsi
 
     def _rhs_exact(self, Psi_gpu, t):
         cos_t = float(np.cos(self._omega * t))
@@ -591,11 +654,25 @@ class BatchGPUSolver:
         return Psi_new, error_norm
 
     def _integrate_gpu(self, Psi, t0, t1):
-        """Adaptive dopri5 integration of the batched state from `t0` to `t1`."""
+        """Adaptive dopri5 integration of the batched state from `t0` to `t1`.
+
+        `max_step` bounds the trial step size regardless of the error
+        controller's own judgment. This matters for drives with sharp
+        features much narrower than the interval being integrated (e.g. an
+        ultrashort pulse): the *initial* step guess here is `(t1-t0)/10`,
+        which can be far wider than such a feature, and the error estimate
+        of a single step that entirely straddles a narrow bump is not
+        guaranteed to flag it (most Runge-Kutta stages can land on either
+        side of the bump and agree with each other while simply missing
+        it). `max_step` is the standard fix (see e.g. `scipy.integrate.
+        solve_ivp`'s `max_step`): cap the step at something smaller than the
+        known feature width and the controller can no longer step over it
+        blindly.
+        """
         cp = self._cp
         Psi_gpu = cp.asarray(Psi)
         t = t0
-        dt = (t1 - t0) / 10.0
+        dt = min((t1 - t0) / 10.0, self.max_step)
         dt_min = 1e-12
 
         for _ in range(self.nsteps):
@@ -607,6 +684,7 @@ class BatchGPUSolver:
                 Psi_gpu = Psi_new
                 t += dt
                 dt *= min(5.0, 0.9 * error ** (-0.2)) if error > 0 else 5.0
+                dt = min(dt, self.max_step)
             else:
                 dt = max(dt_min, dt * max(0.1, 0.9 * error ** (-0.25)))
         else:
@@ -653,6 +731,9 @@ class BatchGPUSolver:
         Psi = np.stack([state.psibar for state in self._states], axis=1)
 
         if getattr(self, '_exact_H_ready', False):
+            return self._integrate_gpu(Psi, t_current, time)
+
+        if getattr(self, '_continuous_local_ready', False):
             return self._integrate_gpu(Psi, t_current, time)
 
         if not getattr(self, '_fast_update_ready', False):
